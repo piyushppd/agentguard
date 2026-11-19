@@ -50,4 +50,4 @@ another to critique.
 ## Honest framing
 
 This is a personal reference build, not a production system or a client deliverable.
-It runs simulated agents. Describe it as "I built and tested" and not "I deployed".
+It runs simulated agents.
