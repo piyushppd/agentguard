@@ -2,52 +2,57 @@
 
 ![tests](https://github.com/piyushppd/agentguard/actions/workflows/tests.yml/badge.svg)
 
-A small, dependency-free Python reference build that turns three ideas from
-Satya Nadella's Pragmatic Engineer interview (Nov 2026) into working controls:
+A small, dependency-free Python reference build of the agent identity and
+security architecture I've been writing about. It turns the arguments into
+controls you can run, break and test.
 
-| Idea from the episode | What AgentGuard implements |
-|---|---|
-| "Treat agents as insider risk" | Agents are non-human identities with an accountable human owner, least-privilege scopes, expiry, and JIT elevation approved by someone other than the owner |
-| "Audited, tamper-proof logs of agent reasoning" | Every tool call is logged *with the agent's stated reasoning* in an HMAC hash chain; any edit, deletion or reordering is detected and located |
-| "Verification is the hard part" / models delete failing tests | An independent verifier blocks test deletion, removed assertions, skipped tests and `assert True`, and refuses a second-opinion model from the same family as the producer. Commits can't pass the gate without an approved verdict |
-| Access certification for agent populations | A review campaign that flags orphaned delegation, unused scopes, SoD conflicts and repeated denied calls, using audit-log evidence rather than rubber-stamping |
+- Article: [Agentic AI Security](https://www.linkedin.com/pulse/agentic-ai-security-piyush-deshmukh-wldpc/) (Aug 2026)
+- LinkedIn posts: *Are AI agents really "going rogue"?* and *Risk-adaptive autonomy and least agency* (Nov 2026)
+- Prompted by Satya Nadella on The Pragmatic Engineer (Nov 2026): treat agents as insider risk; verification is the hard part
+
+> **Scope, honestly:** this is a personal reference build with simulated agents
+> and an HMAC-signed token simulation. It is not a production system, an OAuth
+> server, or a client deliverable.
+
+## From the writing to the code
+
+| What I argued | Where it lives | What the demo shows |
+|---|---|---|
+| **Registry and ownership:** every agent has a named human owner and a review obligation | `identity.py` | No active owner, no agent. An owner can't delegate authority they don't hold |
+| **Delegated authorization with short-lived credentials (RFC 8693)**, tied to the originating human's consent | `delegation.py` | Erin → triage-agent → refund-agent: nested `act` claim, task-scoped, 10-minute tokens carrying her consent and a SGD 200 limit |
+| **Agent-to-agent calls must not expand authority at each hop**, but must stay traceable | `delegation.py` | Child scopes must be a subset of the parent's; limits only tighten; depth capped; loops refused. A hop requesting `payments:create` is refused |
+| **Revoke the human, the agent keeps working**, which most tooling misses | `policy.py`, `delegation.py` | Tokens are validated on *every use*: Erin leaves and her live token dies mid-workflow. Carol leaves and her unprovisioned agent is denied |
+| **Per-call policy enforcement** | `policy.py` | Every call passes identity → purpose → delegation → authority → risk → verification → rate limit |
+| **Least agency:** limit the decisions an agent may take, not just its access; purpose-bound agents | `Agent.allowed_tools` | invoice-agent is denied a ticket tool outside its purpose, even though nothing else would stop it |
+| **Risk-adaptive autonomy, not "approve every action"** | `ToolSpec.approval_rule`, `irreversible`, `sensitive` | SGD 1,200 payment goes through on its own; SGD 12,400 waits for a 15-minute approval from someone other than the owner |
+| **Contain the agent when behaviour leaves the boundary** | `PolicyGate._maybe_contain` | A prompt injection makes triage-agent try `grant_admin`; after three denied calls it's suspended automatically and a containment event is logged |
+| **A correlated audit trail:** human → agent → policy decision → credential → downstream action | `audit.py` | Each record carries trace ID, parent span, originating human, delegation chain, token, consent, the agent's stated reasoning, decision and result. HMAC hash chain; editing one record is caught at that record |
+| **Forward telemetry to the SIEM** | `siem.py` | JSON lines laid out like OCSF API Activity (class 6003), with containment as a detection finding |
+| **Access review without a stable baseline; the quarterly cadence is wrong** | `certification.py` | The baseline is evidence from the log. Reviews run on schedule *or* on events: Carol's leaver event triggers a review of just her agents |
+| **Inventory, including agents built outside the sanctioned path** | `unregistered_identities()` | `shadow-bot` calls the gate, is denied, and appears in the report |
+| **Verification is the hard part** (Nadella) | `verifier.py` | Deleting a failing test is blocked; a critic from the same model family is rejected as not independent; commits need an approved verdict |
 
 ## Run it
 
 ```bash
-python3 demo.py                      # scenario: 3 agents in a bank ops team
-python3 tests/test_agentguard.py     # 13 unit tests
+python3 demo.py                      # 9-step scenario, 4 agents in a bank ops team
+python3 tests/test_agentguard.py     # 20 unit tests
 ```
 
-Python 3.10+ only, nothing to install. Outputs land in `out/`:
-`audit.jsonl` (the hash chain) and `certification_report.md`.
+Python 3.10+, nothing to install. Outputs land in `out/`: `audit.jsonl`,
+`siem_events.jsonl`, `certification_report.md`, `triggered_review.md`.
 A sample report is in [`docs/`](docs/sample_certification_report.md).
 
-## What the demo shows
+## What it deliberately doesn't do (yet)
 
-1. An owner can't hand an agent authority they don't hold themselves.
-2. A sensitive PII export stops at NEEDS_APPROVAL; the owner can't self-approve; a security reviewer grants a 15-minute JIT window.
-3. A prompt injection in a ticket makes the triage agent try `grant_admin` three times. Every attempt is denied and logged, and the attempts show up in the certification.
-4. The release agent "fixes" a build by deleting the failing test. The verifier blocks it, rejects a same-family critic, and the gate refuses the commit. A real fix approved by a different model family goes through.
-5. The agent's owner leaves the bank and nobody deprovisions the agent. The gate denies anyway, because authority is checked against the *current* owner.
-6. Certification: release-agent → REVOKE_OR_REASSIGN, invoice-agent → REMEDIATE_SOD, triage-agent → REDUCE.
-7. Tamper test: editing one log line to hide the PII export is caught at the exact record.
+- **Real tokens.** Delegation is an HMAC-signed simulation of RFC 8693 claims. In production the same claims come from your IdP's token-exchange endpoint, with credentials issued just in time (e.g. from Vault).
+- **Real agents.** Agents are scripted. `agentguard/llm.py` shows how to plug in Claude or a local model as the cross-family critic.
+- **Intent.** Identity scoping limits capability, not intent. Containment here is a simple threshold on denied calls, not behavioural analytics.
+- **Egress control and network containment.** These belong in infrastructure (next step).
 
-## Plug in a real model
+## Roadmap
 
-`agentguard/llm.py` has a stdlib-only Claude critic (`ANTHROPIC_API_KEY`) and a
-commented Ollama example for a local open model. Use one family to produce and
-another to critique.
-
-## Build roadmap (each step = one more hands-on skill)
-
-1. **Now:** run the demo, change the policies, break it, read the code.
-2. **Real agent in the loop:** replace the scripted calls with a Claude or local Llama agent whose tool calls go through `PolicyGate.call`. Expose the gate as an MCP server so any MCP client must pass through it.
-3. **Cloud-native hardening (your AWS sandbox):** HMAC key in KMS, chain head anchored to S3 Object Lock every N records, agent identities as IAM roles with session tags, JIT through a Step Functions approval.
-4. **Private evals:** a set of attack scenarios (prompt injection, reward hacking, data exfiltration) scored against two or three models. This is Nadella's "swap any model and still pass your private evals" test.
-5. **Agentic GRC:** have an agent collect control evidence (MAS TRM style) through the same gate, with the certification report as its output.
-
-## Honest framing
-
-This is a personal reference build, not a production system or a client deliverable.
-It runs simulated agents.
+1. Put a real Claude or local Llama agent in the loop; expose the gate as an MCP server.
+2. AWS sandbox hardening: HMAC key in KMS, chain head anchored to S3 Object Lock, agent identities as IAM roles with session tags, egress through a controlled proxy.
+3. Private evals: prompt-injection, reward-hacking and exfiltration scenarios scored across model families.
+4. Agentic GRC: an agent collecting MAS TRM-style control evidence through the same gate.

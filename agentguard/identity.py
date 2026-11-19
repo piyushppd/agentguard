@@ -49,6 +49,8 @@ class Agent:
     expires_at: datetime = field(default_factory=lambda: now() + timedelta(days=90))
     jit_grants: list[JITGrant] = field(default_factory=list)
     suspended: bool = False
+    # Least agency: the tools this agent's purpose needs. Empty = not purpose-bound.
+    allowed_tools: set[str] = field(default_factory=set)
 
     def active_jit_scopes(self, at: datetime | None = None) -> set[str]:
         return {g.scope for g in self.jit_grants if g.valid(at)}
@@ -91,8 +93,11 @@ class Directory:
         agent.jit_grants.append(grant)
         return grant
 
-    def offboard_human(self, user_id: str) -> None:
+    def offboard_human(self, user_id: str) -> list[str]:
         """Leaver event. Note: we deliberately do NOT touch the agents here,
         because most real IAM stacks don't — the policy gate and the
-        certification campaign have to catch the orphaned agents."""
+        certification campaign have to catch the orphaned agents.
+        Returns the agents this human owns, so a review can be *triggered*
+        by the event instead of waiting for the next quarterly cycle."""
         self.humans[user_id].active = False
+        return [a.agent_id for a in self.agents.values() if a.owner_id == user_id]

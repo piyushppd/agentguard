@@ -118,5 +118,109 @@ class Certification(unittest.TestCase):
         self.assertEqual(items[0].recommendation, "REVOKE_OR_REASSIGN")
 
 
+def deleg_setup():
+    from agentguard import TokenService
+    d = Directory()
+    d.add_human(Human("u", "User", "CS", {"t:read", "r:create"}))
+    d.add_human(Human("o", "Owner", "Ops", {"t:read", "r:create", "p:create"}))
+    d.register_agent(Agent("a", "triage", "o", "gpt-4o", {"t:read"}))
+    d.register_agent(Agent("b", "refund", "o", "gemini", {"r:create"}))
+    d.register_agent(Agent("c", "pay", "o", "claude", {"p:create"}))
+    log = AuditLog(Path(tempfile.mkdtemp()) / "a.jsonl", os.urandom(16))
+    ts = TokenService(d, os.urandom(16), audit=log)
+    g = PolicyGate(d, log, tokens=ts)
+    g.register_tool(ToolSpec("read", "t:read"), lambda **k: "ok")
+    g.register_tool(ToolSpec("refund", "r:create"), lambda **k: "ok")
+    return d, log, ts, g
+
+
+class Delegation(unittest.TestCase):
+    def test_scope_is_intersection_and_chain_attenuates(self):
+        from agentguard import DelegationError
+        d, log, ts, g = deleg_setup()
+        t1 = ts.exchange_user_token("u", "a", {"t:read", "r:create", "p:create"},
+                                    "resolve", {"max_amount": 200})
+        self.assertEqual(t1.scopes, {"t:read", "r:create"})  # p:create: user lacks it
+        t2 = ts.exchange_for_agent(t1, "b", {"r:create"}, tighten={"max_amount": 500})
+        self.assertEqual(t2.limits["max_amount"], 200)       # can only tighten
+        self.assertEqual(t2.claims()["act"], {"sub": "b", "act": {"sub": "a"}})
+        with self.assertRaises(DelegationError):
+            ts.exchange_for_agent(t1, "c", {"p:create"})     # expansion refused
+        with self.assertRaises(DelegationError):
+            ts.exchange_for_agent(t2, "a", {"r:create"})     # loop refused
+
+    def test_token_enforced_on_every_use(self):
+        d, log, ts, g = deleg_setup()
+        t1 = ts.exchange_user_token("u", "a", {"t:read", "r:create"}, "x", {"max_amount": 200})
+        t2 = ts.exchange_for_agent(t1, "b", {"r:create"})
+        self.assertEqual(g.call("b", "refund", {"amount": 100}, "r", token=t2).decision, Decision.ALLOW)
+        self.assertEqual(g.call("b", "refund", {"amount": 300}, "r", token=t2).decision, Decision.DENY)
+        self.assertEqual(g.call("a", "refund", {"amount": 1}, "r", token=t2).decision, Decision.DENY)
+        d.offboard_human("u")
+        res = g.call("b", "refund", {"amount": 100}, "r", token=t2)
+        self.assertIn("no longer active", res.reason)
+
+    def test_revoking_parent_kills_child_and_forgery_detected(self):
+        import dataclasses
+        d, log, ts, g = deleg_setup()
+        t1 = ts.exchange_user_token("u", "a", {"t:read", "r:create"}, "x")
+        t2 = ts.exchange_for_agent(t1, "b", {"r:create"})
+        forged = dataclasses.replace(t2, scopes=frozenset({"r:create", "t:read", "p:create"}))
+        self.assertEqual(ts.validate(forged)[1], "token signature invalid")
+        ts.revoke(t1.token_id)
+        self.assertFalse(ts.validate(t2)[0])
+
+    def test_trace_and_siem_export(self):
+        from agentguard import export_jsonl
+        d, log, ts, g = deleg_setup()
+        t1 = ts.exchange_user_token("u", "a", {"t:read"}, "x")
+        g.call("a", "read", {}, "r", token=t1)
+        out = Path(tempfile.mkdtemp()) / "s.jsonl"
+        self.assertEqual(export_jsonl(log, out), 2)
+        ev = [__import__("json").loads(l) for l in out.read_text().splitlines()][-1]
+        self.assertEqual(ev["actor"]["user"]["uid"], "u")
+        self.assertEqual(ev["metadata"]["correlation_uid"], t1.trace_id)
+
+
+class LeastAgencyAndContainment(unittest.TestCase):
+    def test_purpose_bound_and_risk_adaptive(self):
+        from agentguard import amount_over
+        d = Directory()
+        d.add_human(Human("o", "O", "X", {"p:create", "x:read"}))
+        d.add_human(Human("r", "R", "Sec", set()))
+        d.register_agent(Agent("ag", "pay", "o", "claude", {"p:create", "x:read"},
+                               allowed_tools={"pay"}))
+        log = AuditLog(Path(tempfile.mkdtemp()) / "a.jsonl", os.urandom(16))
+        g = PolicyGate(d, log)
+        g.register_tool(ToolSpec("pay", "p:create", approval_rule=amount_over(1000)), lambda **k: 1)
+        g.register_tool(ToolSpec("peek", "x:read"), lambda **k: 1)
+        self.assertEqual(g.call("ag", "pay", {"amount": 10}, "r").decision, Decision.ALLOW)
+        self.assertEqual(g.call("ag", "pay", {"amount": 5000}, "r").decision, Decision.NEEDS_APPROVAL)
+        self.assertEqual(g.call("ag", "peek", {}, "r").decision, Decision.DENY)
+        d.grant_jit("ag", "p:create", "r", "ok")
+        self.assertEqual(g.call("ag", "pay", {"amount": 5000}, "r").decision, Decision.ALLOW)
+
+    def test_auto_containment_and_unregistered(self):
+        from agentguard import unregistered_identities
+        d, log, g = setup()
+        for _ in range(3):
+            g.call("ag", "nope_tool", {}, "r")
+        self.assertTrue(d.agents["ag"].suspended)
+        self.assertEqual(g.call("ag", "read", {}, "r").decision, Decision.DENY)
+        self.assertTrue(any(r["event"] == "containment" for r in log.records()))
+        g.call("ghost", "read", {}, "r")
+        self.assertEqual(unregistered_identities(d, log), {"ghost": 1})
+        items = run_campaign(d, log, {"read": "a:read"})
+        self.assertEqual(items[0].recommendation, "CONTAINED")
+
+    def test_event_triggered_review_scope(self):
+        d, log, g = setup()
+        d.register_agent(Agent("ag2", "t", "r", "gpt", set()))
+        affected = d.offboard_human("o")
+        self.assertEqual(affected, ["ag"])
+        items = run_campaign(d, log, {}, agent_ids=affected)
+        self.assertEqual([i.agent_id for i in items], ["ag"])
+
+
 if __name__ == "__main__":
     unittest.main()
