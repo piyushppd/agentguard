@@ -38,17 +38,16 @@ Every tool call passes through the gate. Checks run in this order and the
 first failure decides; every outcome is logged with the agent's reasoning.
 
 ```mermaid
-flowchart LR
-    A["Agent tool call"] --> B["Identity<br/>registered, active,<br/>owner still active"]
-    B --> C["Least agency<br/>tool inside purpose"]
-    C --> D["Delegation<br/>token valid on use,<br/>scope + limits"]
-    D --> E["Authority<br/>standing scope or JIT"]
-    E --> F["Risk-adaptive<br/>human needed for<br/>this action?"]
-    F --> G["Verification<br/>+ rate limit"]
-    G --> OK["ALLOW"]
-    B & C & D & E & G -.-> X["DENY"]
-    F -.-> N["NEEDS_APPROVAL<br/>JIT by someone<br/>other than owner"]
-    X -.-> S["Repeated DENYs →<br/>agent contained"]
+flowchart TD
+    A["Agent tool call + stated reasoning"] --> B["1 · Identity: registered, active, owner still active"]
+    B --> C["2 · Least agency: tool inside the agent's purpose"]
+    C --> D["3 · Delegation: token valid on use, scope and limits"]
+    D --> E["4 · Authority: standing scope or JIT grant"]
+    E --> F{"5 · Risk-adaptive: does this action need a human?"}
+    F -- "yes, not yet approved" --> N["NEEDS_APPROVAL: JIT by someone other than the owner"]
+    F -- "no, or approved" --> G["6 · Verification and rate limit"]
+    G --> OK["ALLOW: tool runs, result logged"]
+    X["Any failed check → DENY"] --> S["Repeated DENYs → agent contained"]
 ```
 
 Full workflows (decision tree, delegation sequence, agent lifecycle) and every
