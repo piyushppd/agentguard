@@ -32,6 +32,29 @@ controls you can run, break and test.
 | **Inventory, including agents built outside the sanctioned path** | `unregistered_identities()` | `shadow-bot` calls the gate, is denied, and appears in the report |
 | **Verification is the hard part** (Nadella) | `verifier.py` | Deleting a failing test is blocked; a critic from the same model family is rejected as not independent; commits need an approved verdict |
 
+## How a call is decided
+
+Every tool call passes through the gate. Checks run in this order and the
+first failure decides; every outcome is logged with the agent's reasoning.
+
+```mermaid
+flowchart LR
+    A["Agent tool call"] --> B["Identity<br/>registered, active,<br/>owner still active"]
+    B --> C["Least agency<br/>tool inside purpose"]
+    C --> D["Delegation<br/>token valid on use,<br/>scope + limits"]
+    D --> E["Authority<br/>standing scope or JIT"]
+    E --> F["Risk-adaptive<br/>human needed for<br/>this action?"]
+    F --> G["Verification<br/>+ rate limit"]
+    G --> OK["ALLOW"]
+    B & C & D & E & G -.-> X["DENY"]
+    F -.-> N["NEEDS_APPROVAL<br/>JIT by someone<br/>other than owner"]
+    X -.-> S["Repeated DENYs →<br/>agent contained"]
+```
+
+Full workflows (decision tree, delegation sequence, agent lifecycle) and every
+configuration option, with worked examples, are in
+**[docs/OPTIONS.md](docs/OPTIONS.md)**.
+
 ## Run it
 
 ```bash
